@@ -1,0 +1,23 @@
+# Default configuration for Cooperation Collapse experiments
+
+defaults:
+  - algorithm: ippo
+  - environment: cleanup
+  - experiment: baseline
+
+# Random seed
+seed: 42
+
+# Logging
+logging:
+  use_wandb: false
+  use_tensorboard: true
+  log_interval: 100
+  save_interval: 1000
+  log_dir: outputs/logs
+
+# Checkpointing
+checkpointing:
+  save_dir: checkpoints
+  save_best: true
+  save_last: true

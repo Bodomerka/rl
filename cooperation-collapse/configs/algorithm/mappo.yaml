@@ -1,0 +1,36 @@
+# Multi-Agent PPO Configuration
+
+name: mappo
+
+# PPO hyperparameters
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_loss_coef: 0.5
+entropy_coef: 0.01
+max_grad_norm: 10.0  # Higher for MAPPO
+
+# Training
+learning_rate: 5.0e-4  # Higher for MAPPO
+num_epochs: 15  # More epochs for MAPPO
+num_minibatches: 1
+rollout_length: 128
+total_timesteps: 10_000_000
+
+# Network architecture
+actor_network:
+  hidden_dims: [64, 64]
+  activation: relu
+
+critic_network:
+  hidden_dims: [128, 128]  # Larger critic
+  activation: relu
+  use_world_state: true  # Centralized critic
+
+# Parameter sharing
+parameter_sharing: true
+
+# Normalization
+normalize_advantages: true
+normalize_observations: false
+normalize_rewards: false

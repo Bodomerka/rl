@@ -1,0 +1,30 @@
+# Phase 2: Defector Training Configuration
+
+name: defector_training
+
+description: "Train a defector agent against frozen cooperative population"
+
+# Load cooperative checkpoint
+cooperative_checkpoint: checkpoints/cooperative/best.pkl
+
+# Environment settings
+environment:
+  common_reward: false  # Individual rewards for defector
+  num_agents: 8
+
+# Defector settings
+defector:
+  agent_id: 0  # Which agent is the defector
+  freeze_others: true  # Freeze cooperative agents
+
+  # Reward shaping for selfish behavior
+  reward_shaping:
+    apple_bonus: 1.5
+    cleaning_penalty: -0.2
+    proximity_bonus: 0.05
+    blocking_bonus: 0.0  # Optional: reward for blocking others
+
+# Training settings
+training:
+  total_timesteps: 2_000_000
+  eval_interval: 25_000

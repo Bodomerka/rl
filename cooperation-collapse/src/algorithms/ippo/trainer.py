@@ -1,0 +1,559 @@
+"""
+Independent PPO Trainer
+
+Implements the IPPO training algorithm for multi-agent environments.
+Each agent uses its own actor-critic network (with optional parameter sharing).
+"""
+
+from dataclasses import dataclass
+from typing import Dict, Optional, Callable, Any, Tuple
+from functools import partial
+import numpy as np
+
+import jax
+import jax.numpy as jnp
+import optax
+from flax.training import train_state
+
+from src.algorithms.ippo.network import ActorCritic, create_actor_critic, init_network
+from src.algorithms.ippo.buffer import RolloutBuffer
+
+
+@dataclass
+class IPPOConfig:
+    """Configuration for IPPO trainer."""
+    # PPO hyperparameters
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_epsilon: float = 0.2
+    value_loss_coef: float = 0.5
+    entropy_coef: float = 0.01
+    max_grad_norm: float = 0.5
+
+    # Training
+    learning_rate: float = 2.5e-4
+    num_epochs: int = 4
+    num_minibatches: int = 4
+    rollout_length: int = 128
+    total_timesteps: int = 10_000_000
+
+    # Network
+    hidden_dims: tuple = (64, 64)
+    use_cnn: bool = True
+    use_rnn: bool = False
+
+    # Parameter sharing
+    parameter_sharing: bool = True
+
+    # Normalization
+    normalize_advantages: bool = True
+
+
+class IPPOTrainer:
+    """
+    Independent PPO Trainer for multi-agent environments.
+
+    Features:
+    - Optional parameter sharing across agents
+    - GAE advantage estimation
+    - Clipped surrogate objective
+    - Entropy bonus for exploration
+    """
+
+    def __init__(
+        self,
+        env,
+        config: IPPOConfig,
+        seed: int = 42,
+    ):
+        """
+        Initialize IPPO trainer.
+
+        Args:
+            env: Multi-agent environment
+            config: Training configuration
+            seed: Random seed
+        """
+        self.env = env
+        self.config = config
+        self.seed = seed
+
+        self.num_agents = env.num_agents
+        self.action_dim = env.action_space_size
+        self.obs_shape = env.observation_shape
+
+        # Random keys
+        self.rng = jax.random.PRNGKey(seed)
+        self.np_rng = np.random.default_rng(seed)
+
+        # Initialize networks and optimizers
+        self._init_networks()
+
+        # Initialize buffer
+        self.buffer = RolloutBuffer(
+            num_agents=self.num_agents,
+            rollout_length=config.rollout_length,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
+        )
+
+        # Metrics tracking
+        self.total_steps = 0
+        self.episode_rewards = []
+        self.episode_lengths = []
+
+    def _init_networks(self):
+        """Initialize actor-critic networks."""
+        # Create network architecture
+        self.network = create_actor_critic(
+            action_dim=self.action_dim,
+            hidden_dims=self.config.hidden_dims,
+            use_cnn=self.config.use_cnn,
+            use_rnn=self.config.use_rnn,
+        )
+
+        # Sample observation for initialization
+        sample_obs = np.zeros((1, *self.obs_shape), dtype=np.float32)
+
+        # Initialize parameters
+        self.rng, init_rng = jax.random.split(self.rng)
+        params = init_network(self.network, init_rng, sample_obs)
+
+        # Create optimizer
+        tx = optax.chain(
+            optax.clip_by_global_norm(self.config.max_grad_norm),
+            optax.adam(self.config.learning_rate),
+        )
+
+        if self.config.parameter_sharing:
+            # Single set of parameters shared across agents
+            self.train_state = train_state.TrainState.create(
+                apply_fn=self.network.apply,
+                params=params,
+                tx=tx,
+            )
+        else:
+            # Separate parameters per agent
+            self.train_states = {}
+            for agent_id in range(self.num_agents):
+                self.rng, init_rng = jax.random.split(self.rng)
+                agent_params = init_network(self.network, init_rng, sample_obs)
+                self.train_states[agent_id] = train_state.TrainState.create(
+                    apply_fn=self.network.apply,
+                    params=agent_params,
+                    tx=tx,
+                )
+
+    def get_action(
+        self,
+        agent_id: int,
+        observation: np.ndarray,
+    ) -> Tuple[int, float, float]:
+        """
+        Get action for a single agent.
+
+        Args:
+            agent_id: Agent ID
+            observation: Agent's observation
+
+        Returns:
+            action: Sampled action
+            log_prob: Log probability of action
+            value: State value estimate
+        """
+        self.rng, action_rng = jax.random.split(self.rng)
+
+        # Get parameters
+        if self.config.parameter_sharing:
+            params = self.train_state.params
+        else:
+            params = self.train_states[agent_id].params
+
+        # Add batch dimension
+        obs = observation[None, ...]
+
+        # Forward pass
+        logits, value, _ = self.network.apply(params, obs)
+        logits = logits[0]
+        value = value[0, 0]
+
+        # Sample action
+        action_probs = jax.nn.softmax(logits)
+        action = jax.random.categorical(action_rng, logits)
+        action = int(action)
+        log_prob = float(jnp.log(action_probs[action] + 1e-8))
+
+        return action, log_prob, float(value)
+
+    def get_actions(
+        self,
+        observations: Dict[int, np.ndarray],
+    ) -> Tuple[Dict[int, int], Dict[int, float], Dict[int, float]]:
+        """
+        Get actions for all agents (batched for GPU efficiency).
+
+        Args:
+            observations: Dict of observations per agent
+
+        Returns:
+            actions: Dict of actions
+            log_probs: Dict of log probabilities
+            values: Dict of value estimates
+        """
+        # Batch all observations together for efficient GPU inference
+        agent_ids = list(observations.keys())
+        obs_batch = np.stack([observations[i] for i in agent_ids], axis=0)
+
+        self.rng, action_rng = jax.random.split(self.rng)
+
+        # Get parameters (with parameter sharing, same for all agents)
+        if self.config.parameter_sharing:
+            params = self.train_state.params
+        else:
+            # For non-sharing, fall back to sequential (less common case)
+            actions = {}
+            log_probs = {}
+            values = {}
+            for agent_id, obs in observations.items():
+                action, log_prob, value = self.get_action(agent_id, obs)
+                actions[agent_id] = action
+                log_probs[agent_id] = log_prob
+                values[agent_id] = value
+            return actions, log_probs, values
+
+        # Batched forward pass (GPU-efficient)
+        logits, value_preds, _ = self.network.apply(params, obs_batch)
+        value_preds = value_preds.squeeze(-1)
+
+        # Sample actions for all agents at once
+        action_rngs = jax.random.split(action_rng, len(agent_ids))
+        sampled_actions = jax.vmap(jax.random.categorical)(action_rngs, logits)
+
+        # Compute log probs
+        action_probs = jax.nn.softmax(logits)
+        log_probs_batch = jnp.log(
+            action_probs[jnp.arange(len(agent_ids)), sampled_actions] + 1e-8
+        )
+
+        # Convert to dicts
+        actions = {agent_ids[i]: int(sampled_actions[i]) for i in range(len(agent_ids))}
+        log_probs = {agent_ids[i]: float(log_probs_batch[i]) for i in range(len(agent_ids))}
+        values = {agent_ids[i]: float(value_preds[i]) for i in range(len(agent_ids))}
+
+        return actions, log_probs, values
+
+    def collect_rollout(self) -> Dict:
+        """
+        Collect rollout data from environment.
+
+        Returns:
+            info: Dictionary with episode statistics
+        """
+        self.buffer.clear()
+
+        obs, state = self.env.reset()
+        episode_reward = {i: 0.0 for i in range(self.num_agents)}
+        episode_length = 0
+
+        for step in range(self.config.rollout_length):
+            # Get actions
+            actions, log_probs, values = self.get_actions(obs)
+
+            # Environment step
+            next_obs, state, rewards, dones, infos = self.env.step(actions)
+
+            # Store transitions
+            self.buffer.add_batch(
+                observations=obs,
+                actions=actions,
+                rewards=rewards,
+                dones=dones,
+                values=values,
+                log_probs=log_probs,
+            )
+
+            # Track episode stats
+            for agent_id in range(self.num_agents):
+                episode_reward[agent_id] += rewards[agent_id]
+            episode_length += 1
+            self.total_steps += 1
+
+            # Check for episode end
+            if any(dones.values()):
+                self.episode_rewards.append(sum(episode_reward.values()))
+                self.episode_lengths.append(episode_length)
+
+                # Reset
+                obs, state = self.env.reset()
+                episode_reward = {i: 0.0 for i in range(self.num_agents)}
+                episode_length = 0
+            else:
+                obs = next_obs
+
+        # Compute last values for bootstrapping
+        _, _, last_values = self.get_actions(obs)
+        self.buffer.compute_advantages(last_values)
+
+        return {
+            'episode_rewards': self.episode_rewards[-10:] if self.episode_rewards else [],
+            'episode_lengths': self.episode_lengths[-10:] if self.episode_lengths else [],
+            'cleaning_rate': self.env.get_cleaning_rate(),
+        }
+
+    def update(self) -> Dict[str, float]:
+        """
+        Perform PPO update on collected data.
+
+        Returns:
+            metrics: Dictionary of training metrics
+        """
+        metrics = {
+            'policy_loss': 0.0,
+            'value_loss': 0.0,
+            'entropy': 0.0,
+            'total_loss': 0.0,
+        }
+        num_updates = 0
+
+        for epoch in range(self.config.num_epochs):
+            for agent_id in range(self.num_agents):
+                # Get data for this agent
+                obs, actions, old_log_probs, advantages, returns = \
+                    self.buffer.get_all_data(agent_id)
+
+                # Normalize advantages
+                if self.config.normalize_advantages:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                # Convert to JAX arrays
+                obs = jnp.array(obs)
+                actions = jnp.array(actions)
+                old_log_probs = jnp.array(old_log_probs)
+                advantages = jnp.array(advantages)
+                returns = jnp.array(returns)
+
+                # Get training state
+                if self.config.parameter_sharing:
+                    state = self.train_state
+                else:
+                    state = self.train_states[agent_id]
+
+                # Compute loss and update
+                state, loss_info = self._update_step(
+                    state, obs, actions, old_log_probs, advantages, returns
+                )
+
+                # Store updated state
+                if self.config.parameter_sharing:
+                    self.train_state = state
+                else:
+                    self.train_states[agent_id] = state
+
+                # Accumulate metrics
+                for key in metrics:
+                    if key in loss_info:
+                        metrics[key] += loss_info[key]
+                num_updates += 1
+
+        # Average metrics
+        for key in metrics:
+            metrics[key] /= max(num_updates, 1)
+
+        return metrics
+
+    def _create_update_fn(self):
+        """Create JIT-compiled update function."""
+        clip_epsilon = self.config.clip_epsilon
+        value_loss_coef = self.config.value_loss_coef
+        entropy_coef = self.config.entropy_coef
+        network = self.network
+
+        @jax.jit
+        def update_step(
+            state: train_state.TrainState,
+            obs: jnp.ndarray,
+            actions: jnp.ndarray,
+            old_log_probs: jnp.ndarray,
+            advantages: jnp.ndarray,
+            returns: jnp.ndarray,
+        ):
+            def loss_fn(params):
+                # Forward pass
+                logits, values, _ = network.apply(params, obs)
+                values = values.squeeze(-1)
+
+                # Compute action probabilities
+                action_probs = jax.nn.softmax(logits)
+                log_probs = jnp.log(action_probs[jnp.arange(len(actions)), actions] + 1e-8)
+
+                # Policy loss (clipped surrogate)
+                ratio = jnp.exp(log_probs - old_log_probs)
+                clipped_ratio = jnp.clip(ratio, 1 - clip_epsilon, 1 + clip_epsilon)
+                policy_loss = -jnp.minimum(ratio * advantages, clipped_ratio * advantages).mean()
+
+                # Value loss
+                value_loss = ((values - returns) ** 2).mean()
+
+                # Entropy bonus
+                entropy = -(action_probs * jnp.log(action_probs + 1e-8)).sum(axis=-1).mean()
+
+                # Total loss
+                total_loss = (
+                    policy_loss +
+                    value_loss_coef * value_loss -
+                    entropy_coef * entropy
+                )
+
+                return total_loss, {
+                    'policy_loss': policy_loss,
+                    'value_loss': value_loss,
+                    'entropy': entropy,
+                    'total_loss': total_loss,
+                }
+
+            # Compute gradients
+            (loss, loss_info), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+
+            # Apply gradients
+            state = state.apply_gradients(grads=grads)
+
+            return state, loss_info
+
+        return update_step
+
+    def _update_step(
+        self,
+        state: train_state.TrainState,
+        obs: jnp.ndarray,
+        actions: jnp.ndarray,
+        old_log_probs: jnp.ndarray,
+        advantages: jnp.ndarray,
+        returns: jnp.ndarray,
+    ) -> Tuple[train_state.TrainState, Dict[str, float]]:
+        """Single PPO update step (JIT-compiled)."""
+        # Lazy initialization of JIT-compiled function
+        if not hasattr(self, '_jit_update_fn'):
+            self._jit_update_fn = self._create_update_fn()
+
+        state, loss_info = self._jit_update_fn(
+            state, obs, actions, old_log_probs, advantages, returns
+        )
+
+        return state, {k: float(v) for k, v in loss_info.items()}
+
+    def train(
+        self,
+        total_timesteps: Optional[int] = None,
+        callback: Optional[Callable] = None,
+        log_interval: int = 10,
+    ) -> Dict:
+        """
+        Main training loop.
+
+        Args:
+            total_timesteps: Override total timesteps from config
+            callback: Optional callback function(iteration, metrics)
+            log_interval: How often to log progress
+
+        Returns:
+            training_info: Dictionary with training statistics
+        """
+        if total_timesteps is None:
+            total_timesteps = self.config.total_timesteps
+
+        num_iterations = total_timesteps // (self.config.rollout_length * self.num_agents)
+
+        training_info = {
+            'iterations': [],
+            'episode_rewards': [],
+            'cleaning_rates': [],
+            'losses': [],
+        }
+
+        print(f"Starting IPPO training for {total_timesteps} timesteps...")
+        print(f"Num agents: {self.num_agents}, Rollout length: {self.config.rollout_length}")
+
+        for iteration in range(num_iterations):
+            # Collect experience
+            rollout_info = self.collect_rollout()
+
+            # Update policy
+            update_metrics = self.update()
+
+            # Log and track
+            if iteration % log_interval == 0:
+                avg_reward = np.mean(rollout_info['episode_rewards']) if rollout_info['episode_rewards'] else 0
+                print(f"Iter {iteration}/{num_iterations} | "
+                      f"Steps: {self.total_steps} | "
+                      f"Avg Reward: {avg_reward:.2f} | "
+                      f"Cleaning Rate: {rollout_info['cleaning_rate']:.3f} | "
+                      f"Loss: {update_metrics['total_loss']:.4f}")
+
+            # Track history
+            training_info['iterations'].append(iteration)
+            training_info['episode_rewards'].append(
+                np.mean(rollout_info['episode_rewards']) if rollout_info['episode_rewards'] else 0
+            )
+            training_info['cleaning_rates'].append(rollout_info['cleaning_rate'])
+            training_info['losses'].append(update_metrics['total_loss'])
+
+            # Callback
+            if callback is not None:
+                callback(iteration, {**rollout_info, **update_metrics})
+
+        print(f"Training complete! Total steps: {self.total_steps}")
+        return training_info
+
+    def save_checkpoint(self, path: str):
+        """Save model checkpoint."""
+        import pickle
+
+        checkpoint = {
+            'config': self.config,
+            'total_steps': self.total_steps,
+        }
+
+        if self.config.parameter_sharing:
+            checkpoint['params'] = self.train_state.params
+        else:
+            checkpoint['params'] = {
+                agent_id: state.params
+                for agent_id, state in self.train_states.items()
+            }
+
+        with open(path, 'wb') as f:
+            pickle.dump(checkpoint, f)
+
+        print(f"Checkpoint saved to {path}")
+
+    def load_checkpoint(self, path: str):
+        """Load model checkpoint."""
+        import pickle
+
+        with open(path, 'rb') as f:
+            checkpoint = pickle.load(f)
+
+        self.total_steps = checkpoint['total_steps']
+
+        if self.config.parameter_sharing:
+            self.train_state = self.train_state.replace(params=checkpoint['params'])
+        else:
+            for agent_id, params in checkpoint['params'].items():
+                self.train_states[agent_id] = self.train_states[agent_id].replace(params=params)
+
+        print(f"Checkpoint loaded from {path}")
+
+    def get_policy(self, agent_id: int = 0):
+        """Get policy function for inference."""
+        if self.config.parameter_sharing:
+            params = self.train_state.params
+        else:
+            params = self.train_states[agent_id].params
+
+        def policy(obs, rng):
+            obs = obs[None, ...]
+            logits, _, _ = self.network.apply(params, obs)
+            action = jax.random.categorical(rng, logits[0])
+            return int(action)
+
+        return policy

@@ -1,0 +1,44 @@
+# Phase 3: Collapse Dynamics Experiment Configuration
+
+name: collapse_dynamics
+
+description: "Inject defector and measure cooperation collapse"
+
+# Checkpoints to load
+cooperative_checkpoint: checkpoints/cooperative/best.pkl
+defector_checkpoint: checkpoints/defector/best.pkl
+
+# Environment settings
+environment:
+  common_reward: false  # Back to individual rewards
+  num_agents: 8
+
+# Experiment protocol
+protocol:
+  # Baseline measurement (before defector)
+  baseline_steps: 500
+
+  # Defector injection
+  defector_agent_id: 0
+  freeze_defector: true  # Defector doesn't learn during experiment
+
+  # Post-injection observation
+  observation_steps: 2000
+
+# Metrics to track
+metrics:
+  - cleaning_rate
+  - collective_reward
+  - gini_coefficient
+  - pollution_level
+  - resource_sustainability
+  - per_agent_rewards
+  - per_agent_actions
+
+# Brittleness Index parameters
+brittleness:
+  collapse_threshold: 0.5  # 50% drop threshold
+  baseline_window: 100
+
+# Multiple runs for statistical significance
+num_runs: 10
