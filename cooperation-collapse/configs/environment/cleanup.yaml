@@ -4,7 +4,7 @@ name: cleanup
 
 # Grid settings
 grid_size: [25, 18]  # Standard Cleanup map
-max_steps: 1000
+max_steps: 400  # Shorter episodes for faster credit assignment
 
 # Agent settings
 num_agents: 8
@@ -12,7 +12,7 @@ observation_radius: 5  # 11x11 observation window
 
 # Resource dynamics
 apple_respawn_prob: 0.05
-pollution_spawn_prob: 0.5
+pollution_spawn_prob: 0.7  # Faster pollution for clearer feedback
 initial_apple_ratio: 0.15  # Ratio of apple zones filled at start
 cleaning_radius: 1
 

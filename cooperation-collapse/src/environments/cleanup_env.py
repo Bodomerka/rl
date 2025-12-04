@@ -79,9 +79,9 @@ class CleanupEnvironment:
         self,
         num_agents: int = 8,
         grid_size: Tuple[int, int] = (25, 18),
-        max_steps: int = 1000,
+        max_steps: int = 400,  # Shorter episodes for faster credit assignment
         apple_respawn_prob: float = 0.05,
-        pollution_spawn_prob: float = 0.5,
+        pollution_spawn_prob: float = 0.7,  # Faster pollution for clearer feedback
         initial_apple_ratio: float = 0.15,
         common_reward: bool = False,
         seed: int = 42,
@@ -348,8 +348,8 @@ class CleanupEnvironment:
 
     def _update_apples(self, infos: Dict):
         """Respawn apples based on pollution level."""
-        # Apple respawn probability decreases with pollution (cubic falloff)
-        effective_prob = self.apple_respawn_prob * (1 - self.state.pollution_level) ** 3
+        # Apple respawn probability decreases with pollution (linear for clearer feedback)
+        effective_prob = self.apple_respawn_prob * (1 - self.state.pollution_level)
 
         for pos in self.apple_zone_positions:
             if self.state.grid[pos] == self.APPLE_ZONE:
@@ -371,14 +371,17 @@ class CleanupEnvironment:
 
         Returns:
             Observation array of shape (obs_size, obs_size, num_channels)
-            Channels: [walls, river_clean, river_polluted, apples, agents, self]
+            Channels: [walls, river_clean, river_polluted, apples, agents, self, pollution_level]
         """
         agent = self.state.agents[agent_id]
         y, x = agent.position
 
-        # Create observation tensor
-        num_channels = 6
+        # Create observation tensor (7 channels: 6 spatial + 1 global pollution)
+        num_channels = 7
         obs = np.zeros((self.obs_size, self.obs_size, num_channels), dtype=np.float32)
+
+        # Channel 6: Global pollution level (same value everywhere - agent "knows" pollution)
+        obs[:, :, 6] = self.state.pollution_level
 
         # Extract local view
         for dy in range(-self.obs_radius, self.obs_radius + 1):
@@ -414,7 +417,7 @@ class CleanupEnvironment:
     @property
     def observation_shape(self) -> Tuple[int, ...]:
         """Shape of observation array."""
-        return (self.obs_size, self.obs_size, 6)
+        return (self.obs_size, self.obs_size, 7)  # 6 spatial + 1 pollution
 
     @property
     def action_space_size(self) -> int:
