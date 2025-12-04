@@ -47,6 +47,9 @@ class ExperimentConfig:
     observation_steps: int = 2000
     freeze_defector: bool = True
 
+    # Parallelization
+    num_envs: int = 4  # Number of parallel environments
+
     # General
     seed: int = 42
     output_dir: str = "outputs/experiments"
@@ -168,13 +171,24 @@ class ExperimentRunner:
             seed=self.config.seed,
         )
 
+        # Environment creator for parallel envs
+        def env_creator(seed):
+            return CleanupEnvironment(
+                num_agents=self.config.num_agents,
+                grid_size=self.config.grid_size,
+                max_steps=self.config.max_steps,
+                common_reward=self.config.phase1_common_reward,
+                seed=seed,
+            )
+
         # Create IPPO trainer
         ippo_config = IPPOConfig(
             total_timesteps=self.config.phase1_timesteps,
             rollout_length=128,
+            num_envs=self.config.num_envs,
             hidden_dims=(64, 64),
         )
-        trainer = IPPOTrainer(env, ippo_config, seed=self.config.seed)
+        trainer = IPPOTrainer(env, ippo_config, seed=self.config.seed, env_creator=env_creator)
 
         # Training callback with early stopping
         early_stop = False

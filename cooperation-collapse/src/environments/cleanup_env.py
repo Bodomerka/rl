@@ -82,6 +82,7 @@ class CleanupEnvironment:
         max_steps: int = 1000,
         apple_respawn_prob: float = 0.05,
         pollution_spawn_prob: float = 0.5,
+        initial_apple_ratio: float = 0.15,
         common_reward: bool = False,
         seed: int = 42,
     ):
@@ -93,6 +94,7 @@ class CleanupEnvironment:
             grid_size: (height, width) of the grid
             apple_respawn_prob: Probability of apple respawning each step
             pollution_spawn_prob: Probability of pollution appearing
+            initial_apple_ratio: Ratio of apple zones to fill with apples at start
             common_reward: If True, rewards are shared equally among agents
             seed: Random seed
         """
@@ -101,6 +103,7 @@ class CleanupEnvironment:
         self.max_steps = max_steps
         self.apple_respawn_prob = apple_respawn_prob
         self.pollution_spawn_prob = pollution_spawn_prob
+        self.initial_apple_ratio = initial_apple_ratio
         self.common_reward = common_reward
 
         self.rng = np.random.default_rng(seed)
@@ -159,7 +162,7 @@ class CleanupEnvironment:
         grid = self.base_grid.copy()
 
         # Spawn initial apples
-        num_initial_apples = len(self.apple_zone_positions) // 4
+        num_initial_apples = int(len(self.apple_zone_positions) * self.initial_apple_ratio)
         apple_positions = self.rng.choice(
             len(self.apple_zone_positions),
             size=num_initial_apples,
@@ -345,8 +348,8 @@ class CleanupEnvironment:
 
     def _update_apples(self, infos: Dict):
         """Respawn apples based on pollution level."""
-        # Apple respawn probability decreases with pollution
-        effective_prob = self.apple_respawn_prob * (1 - self.state.pollution_level)
+        # Apple respawn probability decreases with pollution (cubic falloff)
+        effective_prob = self.apple_respawn_prob * (1 - self.state.pollution_level) ** 3
 
         for pos in self.apple_zone_positions:
             if self.state.grid[pos] == self.APPLE_ZONE:

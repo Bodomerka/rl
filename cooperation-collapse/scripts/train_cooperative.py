@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--no-plots", action="store_true", help="Disable plotting")
     parser.add_argument("--rollout-length", type=int, default=512,
                         help="Rollout length (larger = faster on GPU)")
+    parser.add_argument("--num-envs", type=int, default=4,
+                        help="Number of parallel environments (default: 4)")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -38,6 +40,7 @@ def main():
     print("=" * 60)
     print(f"Agents: {args.num_agents}")
     print(f"Timesteps: {args.timesteps:,}")
+    print(f"Parallel envs: {args.num_envs}")
     print(f"Seed: {args.seed}")
     print()
 
@@ -52,6 +55,7 @@ def main():
     config = IPPOConfig(
         total_timesteps=args.timesteps,
         rollout_length=args.rollout_length,  # Larger = better GPU utilization
+        num_envs=args.num_envs,  # Parallel environments
         learning_rate=2.5e-4,
         num_epochs=4,
         hidden_dims=(64, 64),
@@ -59,10 +63,19 @@ def main():
     )
 
     print(f"Rollout length: {args.rollout_length}")
+    print(f"Effective batch size: {args.rollout_length * args.num_envs * args.num_agents}")
     print()
 
+    # Environment creator for parallel envs
+    def env_creator(seed):
+        return CleanupEnvironment(
+            num_agents=args.num_agents,
+            common_reward=True,
+            seed=seed,
+        )
+
     # Create trainer
-    trainer = IPPOTrainer(env, config, seed=args.seed)
+    trainer = IPPOTrainer(env, config, seed=args.seed, env_creator=env_creator)
 
     # Setup visualization
     plotter = None

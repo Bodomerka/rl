@@ -6,8 +6,10 @@ Each agent uses its own actor-critic network (with optional parameter sharing).
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Callable, Any, Tuple
+from typing import Dict, Optional, Callable, Any, Tuple, List
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor
+import copy
 import numpy as np
 
 import jax
@@ -37,6 +39,9 @@ class IPPOConfig:
     rollout_length: int = 128
     total_timesteps: int = 10_000_000
 
+    # Parallelization
+    num_envs: int = 1  # Number of parallel environments
+
     # Network
     hidden_dims: tuple = (64, 64)
     use_cnn: bool = True
@@ -65,6 +70,7 @@ class IPPOTrainer:
         env,
         config: IPPOConfig,
         seed: int = 42,
+        env_creator: Optional[Callable] = None,
     ):
         """
         Initialize IPPO trainer.
@@ -73,10 +79,12 @@ class IPPOTrainer:
             env: Multi-agent environment
             config: Training configuration
             seed: Random seed
+            env_creator: Optional function to create new environments for parallelization
         """
         self.env = env
         self.config = config
         self.seed = seed
+        self.num_envs = config.num_envs
 
         self.num_agents = env.num_agents
         self.action_dim = env.action_space_size
@@ -86,13 +94,28 @@ class IPPOTrainer:
         self.rng = jax.random.PRNGKey(seed)
         self.np_rng = np.random.default_rng(seed)
 
+        # Create parallel environments
+        if self.num_envs > 1:
+            if env_creator is not None:
+                self.envs = [env] + [env_creator(seed=seed + i + 1) for i in range(self.num_envs - 1)]
+            else:
+                # Deep copy environments with different seeds
+                self.envs = [env]
+                for i in range(self.num_envs - 1):
+                    env_copy = copy.deepcopy(env)
+                    env_copy.rng = np.random.default_rng(seed + i + 1)
+                    self.envs.append(env_copy)
+            print(f"Created {self.num_envs} parallel environments")
+        else:
+            self.envs = [env]
+
         # Initialize networks and optimizers
         self._init_networks()
 
-        # Initialize buffer
+        # Initialize buffer (larger to accommodate all envs)
         self.buffer = RolloutBuffer(
             num_agents=self.num_agents,
-            rollout_length=config.rollout_length,
+            rollout_length=config.rollout_length * self.num_envs,
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
         )
@@ -101,6 +124,11 @@ class IPPOTrainer:
         self.total_steps = 0
         self.episode_rewards = []
         self.episode_lengths = []
+
+        # Persistent state across rollouts
+        self._env_obs = None
+        self._env_episode_rewards = None
+        self._env_episode_lengths = None
 
     def _init_networks(self):
         """Initialize actor-critic networks."""
@@ -242,62 +270,143 @@ class IPPOTrainer:
 
         return actions, log_probs, values
 
+    def _env_step(self, env_id: int, env, obs: Dict, actions: Dict):
+        """Execute a single environment step (for parallel execution)."""
+        next_obs, state, rewards, dones, infos = env.step(actions)
+        return env_id, next_obs, state, rewards, dones, infos
+
     def collect_rollout(self) -> Dict:
         """
-        Collect rollout data from environment.
+        Collect rollout data from environments (parallel if num_envs > 1).
 
         Returns:
             info: Dictionary with episode statistics
         """
         self.buffer.clear()
 
-        obs, state = self.env.reset()
-        episode_reward = {i: 0.0 for i in range(self.num_agents)}
-        episode_length = 0
+        # Initialize environments only on first call or use persistent state
+        if self._env_obs is None:
+            env_obs = []
+            env_episode_rewards = []
+            env_episode_lengths = []
+            for env in self.envs:
+                obs, _ = env.reset()
+                env_obs.append(obs)
+                env_episode_rewards.append({i: 0.0 for i in range(self.num_agents)})
+                env_episode_lengths.append(0)
+            self._env_obs = env_obs
+            self._env_episode_rewards = env_episode_rewards
+            self._env_episode_lengths = env_episode_lengths
 
-        for step in range(self.config.rollout_length):
-            # Get actions
-            actions, log_probs, values = self.get_actions(obs)
+        env_obs = self._env_obs
+        env_episode_rewards = self._env_episode_rewards
+        env_episode_lengths = self._env_episode_lengths
 
-            # Environment step
-            next_obs, state, rewards, dones, infos = self.env.step(actions)
+        # Collect rollouts
+        if self.num_envs > 1:
+            # Parallel collection with ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=self.num_envs) as executor:
+                for step in range(self.config.rollout_length):
+                    # Get actions for all environments (batched)
+                    all_actions = []
+                    all_log_probs = []
+                    all_values = []
 
-            # Store transitions
-            self.buffer.add_batch(
-                observations=obs,
-                actions=actions,
-                rewards=rewards,
-                dones=dones,
-                values=values,
-                log_probs=log_probs,
-            )
+                    for env_id in range(self.num_envs):
+                        actions, log_probs, values = self.get_actions(env_obs[env_id])
+                        all_actions.append(actions)
+                        all_log_probs.append(log_probs)
+                        all_values.append(values)
 
-            # Track episode stats
-            for agent_id in range(self.num_agents):
-                episode_reward[agent_id] += rewards[agent_id]
-            episode_length += 1
-            self.total_steps += 1
+                    # Submit all env steps in parallel
+                    futures = []
+                    for env_id, env in enumerate(self.envs):
+                        future = executor.submit(
+                            self._env_step, env_id, env, env_obs[env_id], all_actions[env_id]
+                        )
+                        futures.append(future)
 
-            # Check for episode end
-            if any(dones.values()):
-                self.episode_rewards.append(sum(episode_reward.values()))
-                self.episode_lengths.append(episode_length)
+                    # Collect results
+                    results = [f.result() for f in futures]
 
-                # Reset
-                obs, state = self.env.reset()
-                episode_reward = {i: 0.0 for i in range(self.num_agents)}
-                episode_length = 0
-            else:
-                obs = next_obs
+                    # Process results and store in buffer
+                    for env_id, next_obs, state, rewards, dones, infos in results:
+                        # Store transitions
+                        self.buffer.add_batch(
+                            observations=env_obs[env_id],
+                            actions=all_actions[env_id],
+                            rewards=rewards,
+                            dones=dones,
+                            values=all_values[env_id],
+                            log_probs=all_log_probs[env_id],
+                        )
 
-        # Compute last values for bootstrapping
-        _, _, last_values = self.get_actions(obs)
-        self.buffer.compute_advantages(last_values)
+                        # Track episode stats
+                        for agent_id in range(self.num_agents):
+                            env_episode_rewards[env_id][agent_id] += rewards[agent_id]
+                        env_episode_lengths[env_id] += 1
+                        self.total_steps += 1
+
+                        # Check for episode end
+                        if any(dones.values()):
+                            self.episode_rewards.append(sum(env_episode_rewards[env_id].values()))
+                            self.episode_lengths.append(env_episode_lengths[env_id])
+
+                            # Reset this environment
+                            env_obs[env_id], _ = self.envs[env_id].reset()
+                            env_episode_rewards[env_id] = {i: 0.0 for i in range(self.num_agents)}
+                            env_episode_lengths[env_id] = 0
+                        else:
+                            env_obs[env_id] = next_obs
+        else:
+            # Single environment (original behavior)
+            for step in range(self.config.rollout_length):
+                actions, log_probs, values = self.get_actions(env_obs[0])
+                next_obs, state, rewards, dones, infos = self.env.step(actions)
+
+                self.buffer.add_batch(
+                    observations=env_obs[0],
+                    actions=actions,
+                    rewards=rewards,
+                    dones=dones,
+                    values=values,
+                    log_probs=log_probs,
+                )
+
+                for agent_id in range(self.num_agents):
+                    env_episode_rewards[0][agent_id] += rewards[agent_id]
+                env_episode_lengths[0] += 1
+                self.total_steps += 1
+
+                if any(dones.values()):
+                    self.episode_rewards.append(sum(env_episode_rewards[0].values()))
+                    self.episode_lengths.append(env_episode_lengths[0])
+                    env_obs[0], _ = self.env.reset()
+                    env_episode_rewards[0] = {i: 0.0 for i in range(self.num_agents)}
+                    env_episode_lengths[0] = 0
+                else:
+                    env_obs[0] = next_obs
+
+        # Compute last values for bootstrapping (use average across envs)
+        all_last_values = []
+        for env_id in range(self.num_envs):
+            _, _, last_values = self.get_actions(env_obs[env_id])
+            all_last_values.append(last_values)
+
+        # Average last values across environments
+        avg_last_values = {
+            agent_id: np.mean([lv[agent_id] for lv in all_last_values])
+            for agent_id in range(self.num_agents)
+        }
+        self.buffer.compute_advantages(avg_last_values)
+
+        # Aggregate cleaning rate from all environments
+        avg_cleaning_rate = np.mean([env.get_cleaning_rate() for env in self.envs])
 
         return {
             'episode_rewards': self.episode_rewards[-10:] if self.episode_rewards else [],
             'episode_lengths': self.episode_lengths[-10:] if self.episode_lengths else [],
-            'cleaning_rate': self.env.get_cleaning_rate(),
+            'cleaning_rate': avg_cleaning_rate,
         }
 
     def update(self) -> Dict[str, float]:
@@ -461,7 +570,9 @@ class IPPOTrainer:
         if total_timesteps is None:
             total_timesteps = self.config.total_timesteps
 
-        num_iterations = total_timesteps // (self.config.rollout_length * self.num_agents)
+        # Account for parallel environments in iteration count
+        steps_per_iteration = self.config.rollout_length * self.num_agents * self.num_envs
+        num_iterations = total_timesteps // steps_per_iteration
 
         training_info = {
             'iterations': [],
@@ -471,7 +582,7 @@ class IPPOTrainer:
         }
 
         print(f"Starting IPPO training for {total_timesteps} timesteps...")
-        print(f"Num agents: {self.num_agents}, Rollout length: {self.config.rollout_length}")
+        print(f"Num agents: {self.num_agents}, Rollout length: {self.config.rollout_length}, Parallel envs: {self.num_envs}")
 
         for iteration in range(num_iterations):
             # Collect experience

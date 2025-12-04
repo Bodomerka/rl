@@ -13,6 +13,7 @@ observation_radius: 5  # 11x11 observation window
 # Resource dynamics
 apple_respawn_prob: 0.05
 pollution_spawn_prob: 0.5
+initial_apple_ratio: 0.15  # Ratio of apple zones filled at start
 cleaning_radius: 1
 
 # Reward structure
