@@ -19,6 +19,7 @@ from flax.training import train_state
 
 from src.algorithms.ippo.network import ActorCritic, create_actor_critic, init_network
 from src.algorithms.ippo.buffer import RolloutBuffer
+from src.utils.logger import TrainingLogger
 
 
 @dataclass
@@ -581,8 +582,16 @@ class IPPOTrainer:
             'losses': [],
         }
 
-        print(f"Starting IPPO training for {total_timesteps} timesteps...")
-        print(f"Num agents: {self.num_agents}, Rollout length: {self.config.rollout_length}, Parallel envs: {self.num_envs}")
+        # Initialize rich logger
+        logger = TrainingLogger(
+            total_timesteps=total_timesteps,
+            num_agents=self.num_agents,
+            log_interval=log_interval,
+        )
+
+        # Track best cleaning rate for milestones
+        best_cleaning_rate = 0.0
+        milestones = {0.1: False, 0.2: False, 0.3: False, 0.5: False}
 
         for iteration in range(num_iterations):
             # Collect experience
@@ -591,28 +600,43 @@ class IPPOTrainer:
             # Update policy
             update_metrics = self.update()
 
-            # Log and track
-            if iteration % log_interval == 0:
-                avg_reward = np.mean(rollout_info['episode_rewards']) if rollout_info['episode_rewards'] else 0
-                print(f"Iter {iteration}/{num_iterations} | "
-                      f"Steps: {self.total_steps} | "
-                      f"Avg Reward: {avg_reward:.2f} | "
-                      f"Cleaning Rate: {rollout_info['cleaning_rate']:.3f} | "
-                      f"Loss: {update_metrics['total_loss']:.4f}")
+            # Get average reward
+            avg_reward = np.mean(rollout_info['episode_rewards']) if rollout_info['episode_rewards'] else 0
+            cleaning_rate = rollout_info['cleaning_rate']
+
+            # Log with rich logger
+            logger.log(
+                iteration=iteration,
+                steps=self.total_steps,
+                reward=avg_reward,
+                cleaning_rate=cleaning_rate,
+                policy_loss=update_metrics['policy_loss'],
+                value_loss=update_metrics['value_loss'],
+                entropy=update_metrics['entropy'],
+            )
+
+            # Check for milestones
+            if cleaning_rate > best_cleaning_rate:
+                best_cleaning_rate = cleaning_rate
+                for threshold, achieved in milestones.items():
+                    if not achieved and cleaning_rate >= threshold:
+                        milestones[threshold] = True
+                        logger.print_milestone(
+                            f"Cleaning rate reached {threshold*100:.0f}%!"
+                        )
 
             # Track history
             training_info['iterations'].append(iteration)
-            training_info['episode_rewards'].append(
-                np.mean(rollout_info['episode_rewards']) if rollout_info['episode_rewards'] else 0
-            )
-            training_info['cleaning_rates'].append(rollout_info['cleaning_rate'])
+            training_info['episode_rewards'].append(avg_reward)
+            training_info['cleaning_rates'].append(cleaning_rate)
             training_info['losses'].append(update_metrics['total_loss'])
 
             # Callback
             if callback is not None:
                 callback(iteration, {**rollout_info, **update_metrics})
 
-        print(f"Training complete! Total steps: {self.total_steps}")
+        # Print final summary
+        logger.print_summary()
         return training_info
 
     def save_checkpoint(self, path: str):

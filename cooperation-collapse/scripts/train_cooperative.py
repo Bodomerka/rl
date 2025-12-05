@@ -35,15 +35,6 @@ def main():
                         help="Number of parallel environments (default: 4)")
     args = parser.parse_args()
 
-    print("=" * 60)
-    print("COOPERATIVE TRAINING")
-    print("=" * 60)
-    print(f"Agents: {args.num_agents}")
-    print(f"Timesteps: {args.timesteps:,}")
-    print(f"Parallel envs: {args.num_envs}")
-    print(f"Seed: {args.seed}")
-    print()
-
     # Create environment with shared rewards
     env = CleanupEnvironment(
         num_agents=args.num_agents,
@@ -58,13 +49,10 @@ def main():
         num_envs=args.num_envs,  # Parallel environments
         learning_rate=2.5e-4,
         num_epochs=4,
-        hidden_dims=(64, 64),
+        hidden_dims=(128, 128),  # Larger MLP to compensate for no CNN
         parameter_sharing=True,
+        use_cnn=False,  # Use MLP instead of CNN (cuDNN compatibility)
     )
-
-    print(f"Rollout length: {args.rollout_length}")
-    print(f"Effective batch size: {args.rollout_length * args.num_envs * args.num_agents}")
-    print()
 
     # Environment creator for parallel envs
     def env_creator(seed):
@@ -112,15 +100,8 @@ def main():
     # Save plots
     if plotter:
         plotter.save_plots(prefix="cooperative")
-        summary = plotter.get_summary()
-        print(f"\nMax cleaning rate achieved: {summary['cleaning_rate']['max']:.3f}")
-        print(f"Mean cleaning rate: {summary['cleaning_rate']['mean']:.3f}")
 
-    # Print summary
-    print("\n" + "=" * 60)
-    print("TRAINING COMPLETE")
-    print("=" * 60)
-    print(f"Final cleaning rate: {training_info['cleaning_rates'][-1]:.3f}")
+    # Print final info
     print(f"Checkpoint saved to: {output_path}")
     if not args.no_plots:
         print(f"Plots saved to: {args.plots_dir}")
