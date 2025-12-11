@@ -135,10 +135,15 @@ class TrainingLogger:
         num_agents: int = 8,
         log_interval: int = 10,
         show_header: bool = True,
+        num_envs: int = 1,
+        rollout_length: int = 128,
     ):
         self.total_timesteps = total_timesteps
         self.num_agents = num_agents
         self.log_interval = log_interval
+        self.num_envs = num_envs
+        self.rollout_length = rollout_length
+        self.batch_size = num_envs * rollout_length * num_agents
 
         self.metrics = TrainingMetrics()
         self.start_time = time.time()
@@ -158,6 +163,7 @@ class TrainingLogger:
         print(colored("║", Colors.CYAN) + colored("  IPPO TRAINING - Cleanup Environment  ".center(70), Colors.BOLD + Colors.WHITE) + colored("║", Colors.CYAN))
         print(colored("╠" + "═" * 70 + "╣", Colors.CYAN))
         print(colored("║", Colors.CYAN) + f"  Target: {format_number(self.total_timesteps)} steps | Agents: {self.num_agents}".ljust(70) + colored("║", Colors.CYAN))
+        print(colored("║", Colors.CYAN) + f"  Envs: {self.num_envs} | Rollout: {self.rollout_length} | Batch: {format_number(self.batch_size)}".ljust(70) + colored("║", Colors.CYAN))
         print(colored("╚" + "═" * 70 + "╝", Colors.CYAN))
         print()
 
@@ -274,8 +280,8 @@ class TrainingLogger:
 
         print(line)
 
-        # Print detailed stats every 50 iterations
-        if iteration > 0 and iteration % 50 == 0:
+        # Print detailed stats every 10 iterations (or first 5 iterations for debugging)
+        if iteration < 5 or (iteration > 0 and iteration % 10 == 0):
             self._print_detailed_stats()
 
     def _print_detailed_stats(self):

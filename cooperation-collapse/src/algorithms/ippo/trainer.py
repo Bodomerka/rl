@@ -19,6 +19,8 @@ from flax.training import train_state
 
 from src.algorithms.ippo.network import ActorCritic, create_actor_critic, init_network
 from src.algorithms.ippo.buffer import RolloutBuffer
+from src.algorithms.ippo.social_influence import SocialInfluenceReward, create_social_influence
+from src.algorithms.ippo.future_prediction import CollectiveFuturePrediction, create_future_prediction
 from src.utils.logger import TrainingLogger
 
 
@@ -53,6 +55,16 @@ class IPPOConfig:
 
     # Normalization
     normalize_advantages: bool = True
+
+    # Social Influence (Jaques et al., 2019)
+    use_social_influence: bool = False
+    influence_weight: float = 0.1  # λ coefficient for influence reward
+    moa_learning_rate: float = 1e-3  # Learning rate for Model of Other Agents
+
+    # Collective Future Prediction (intrinsic motivation)
+    use_future_prediction: bool = False
+    future_prediction_weight: float = 0.5  # Weight of intrinsic reward
+    prediction_horizon: int = 50  # How many steps ahead to predict
 
 
 class IPPOTrainer:
@@ -121,6 +133,32 @@ class IPPOTrainer:
             gae_lambda=config.gae_lambda,
         )
 
+        # Initialize social influence module
+        self.social_influence = None
+        if config.use_social_influence:
+            obs_dim = int(np.prod(self.obs_shape))
+            self.social_influence = create_social_influence(
+                num_agents=self.num_agents,
+                num_actions=self.action_dim,
+                obs_shape=self.obs_shape,
+                influence_weight=config.influence_weight,
+                seed=seed,
+            )
+            print(f"Social Influence enabled with weight λ={config.influence_weight}")
+
+        # Initialize future prediction module
+        self.future_prediction = None
+        if config.use_future_prediction:
+            self.future_prediction = create_future_prediction(
+                obs_shape=self.obs_shape,
+                num_actions=self.action_dim,
+                num_agents=self.num_agents,
+                intrinsic_weight=config.future_prediction_weight,
+                prediction_horizon=config.prediction_horizon,
+                device='cpu',  # Use CPU for compatibility
+            )
+            print(f"Future Prediction enabled with weight={config.future_prediction_weight}")
+
         # Metrics tracking
         self.total_steps = 0
         self.episode_rewards = []
@@ -130,6 +168,10 @@ class IPPOTrainer:
         self._env_obs = None
         self._env_episode_rewards = None
         self._env_episode_lengths = None
+
+        # Social influence data collection
+        self._si_obs_buffer = []
+        self._si_actions_buffer = []
 
     def _init_networks(self):
         """Initialize actor-critic networks."""
@@ -276,6 +318,86 @@ class IPPOTrainer:
         next_obs, state, rewards, dones, infos = env.step(actions)
         return env_id, next_obs, state, rewards, dones, infos
 
+    def _compute_influence_rewards(
+        self,
+        obs: Dict[int, np.ndarray],
+        actions: Dict[int, int],
+    ) -> Dict[int, float]:
+        """
+        Compute social influence intrinsic rewards.
+
+        Args:
+            obs: Observations for all agents
+            actions: Actions taken by all agents
+
+        Returns:
+            influence_rewards: Dict of influence rewards per agent
+        """
+        if self.social_influence is None:
+            return {i: 0.0 for i in range(self.num_agents)}
+
+        # Stack observations and actions
+        obs_array = np.stack([obs[i].flatten() for i in range(self.num_agents)])
+        actions_array = np.array([actions[i] for i in range(self.num_agents)])
+
+        # Collect for MOA training
+        self._si_obs_buffer.append(obs_array)
+        self._si_actions_buffer.append(actions_array)
+
+        # Compute influence rewards
+        moa_params = {i: self.social_influence.moa_states[i].params
+                      for i in range(self.num_agents)}
+
+        influence = self.social_influence.compute_influence_reward(
+            moa_params, obs_array, actions_array
+        )
+
+        return {i: float(influence[i]) for i in range(self.num_agents)}
+
+    def _add_influence_to_rewards(
+        self,
+        extrinsic_rewards: Dict[int, float],
+        influence_rewards: Dict[int, float],
+    ) -> Dict[int, float]:
+        """Combine extrinsic and influence rewards."""
+        return {
+            i: extrinsic_rewards[i] + influence_rewards[i]
+            for i in range(self.num_agents)
+        }
+
+    def _compute_future_prediction_rewards(
+        self,
+        obs: Dict[int, np.ndarray],
+        actions: Dict[int, int],
+        collective_reward: float,
+    ) -> Dict[int, float]:
+        """
+        Compute intrinsic rewards from future prediction module.
+
+        Args:
+            obs: Observations for all agents
+            actions: Actions taken
+            collective_reward: Sum of extrinsic rewards for all agents
+
+        Returns:
+            intrinsic_rewards: Dict of intrinsic rewards per agent
+        """
+        if self.future_prediction is None:
+            return {i: 0.0 for i in range(self.num_agents)}
+
+        # Add experience to predictor buffer
+        self.future_prediction.add_experience(obs, actions, collective_reward)
+
+        # Compute intrinsic reward
+        intrinsic_rewards = self.future_prediction.compute_intrinsic_reward(obs, actions)
+
+        return intrinsic_rewards
+
+    def _end_episode_future_prediction(self):
+        """Called when episode ends to finalize trajectory for future prediction."""
+        if self.future_prediction is not None:
+            self.future_prediction.end_trajectory()
+
     def collect_rollout(self) -> Dict:
         """
         Collect rollout data from environments (parallel if num_envs > 1).
@@ -284,6 +406,10 @@ class IPPOTrainer:
             info: Dictionary with episode statistics
         """
         self.buffer.clear()
+
+        # Clear social influence buffers
+        self._si_obs_buffer = []
+        self._si_actions_buffer = []
 
         # Initialize environments only on first call or use persistent state
         if self._env_obs is None:
@@ -332,17 +458,32 @@ class IPPOTrainer:
 
                     # Process results and store in buffer
                     for env_id, next_obs, state, rewards, dones, infos in results:
+                        # Compute collective reward for future prediction
+                        collective_reward = sum(rewards.values())
+
+                        # Compute social influence rewards
+                        influence_rewards = self._compute_influence_rewards(
+                            env_obs[env_id], all_actions[env_id]
+                        )
+                        total_rewards = self._add_influence_to_rewards(rewards, influence_rewards)
+
+                        # Compute future prediction intrinsic rewards
+                        fp_rewards = self._compute_future_prediction_rewards(
+                            env_obs[env_id], all_actions[env_id], collective_reward
+                        )
+                        total_rewards = self._add_influence_to_rewards(total_rewards, fp_rewards)
+
                         # Store transitions
                         self.buffer.add_batch(
                             observations=env_obs[env_id],
                             actions=all_actions[env_id],
-                            rewards=rewards,
+                            rewards=total_rewards,  # Use total rewards (extrinsic + intrinsic)
                             dones=dones,
                             values=all_values[env_id],
                             log_probs=all_log_probs[env_id],
                         )
 
-                        # Track episode stats
+                        # Track episode stats (use extrinsic rewards for metrics)
                         for agent_id in range(self.num_agents):
                             env_episode_rewards[env_id][agent_id] += rewards[agent_id]
                         env_episode_lengths[env_id] += 1
@@ -352,6 +493,9 @@ class IPPOTrainer:
                         if any(dones.values()):
                             self.episode_rewards.append(sum(env_episode_rewards[env_id].values()))
                             self.episode_lengths.append(env_episode_lengths[env_id])
+
+                            # End trajectory for future prediction
+                            self._end_episode_future_prediction()
 
                             # Reset this environment
                             env_obs[env_id], _ = self.envs[env_id].reset()
@@ -365,15 +509,29 @@ class IPPOTrainer:
                 actions, log_probs, values = self.get_actions(env_obs[0])
                 next_obs, state, rewards, dones, infos = self.env.step(actions)
 
+                # Compute collective reward for future prediction
+                collective_reward = sum(rewards.values())
+
+                # Compute social influence rewards
+                influence_rewards = self._compute_influence_rewards(env_obs[0], actions)
+                total_rewards = self._add_influence_to_rewards(rewards, influence_rewards)
+
+                # Compute future prediction intrinsic rewards
+                fp_rewards = self._compute_future_prediction_rewards(
+                    env_obs[0], actions, collective_reward
+                )
+                total_rewards = self._add_influence_to_rewards(total_rewards, fp_rewards)
+
                 self.buffer.add_batch(
                     observations=env_obs[0],
                     actions=actions,
-                    rewards=rewards,
+                    rewards=total_rewards,  # Use total rewards (extrinsic + intrinsic)
                     dones=dones,
                     values=values,
                     log_probs=log_probs,
                 )
 
+                # Track episode stats (use extrinsic rewards for metrics)
                 for agent_id in range(self.num_agents):
                     env_episode_rewards[0][agent_id] += rewards[agent_id]
                 env_episode_lengths[0] += 1
@@ -382,6 +540,10 @@ class IPPOTrainer:
                 if any(dones.values()):
                     self.episode_rewards.append(sum(env_episode_rewards[0].values()))
                     self.episode_lengths.append(env_episode_lengths[0])
+
+                    # End trajectory for future prediction
+                    self._end_episode_future_prediction()
+
                     env_obs[0], _ = self.env.reset()
                     env_episode_rewards[0] = {i: 0.0 for i in range(self.num_agents)}
                     env_episode_lengths[0] = 0
@@ -468,6 +630,24 @@ class IPPOTrainer:
         # Average metrics
         for key in metrics:
             metrics[key] /= max(num_updates, 1)
+
+        # Update MOA (Model of Other Agents) if using social influence
+        if self.social_influence is not None and len(self._si_obs_buffer) > 0:
+            # Stack collected data
+            obs_batch = jnp.array(np.stack(self._si_obs_buffer))  # (T, num_agents, obs_dim)
+            actions_batch = jnp.array(np.stack(self._si_actions_buffer))  # (T, num_agents)
+
+            # Update MOA models
+            moa_losses = self.social_influence.update_moa(obs_batch, actions_batch)
+
+            # Add MOA loss to metrics (average across agents)
+            avg_moa_loss = np.mean([v for k, v in moa_losses.items()])
+            metrics['moa_loss'] = avg_moa_loss
+
+        # Update future prediction model
+        if self.future_prediction is not None:
+            fp_metrics = self.future_prediction.update_predictor(num_updates=5)
+            metrics['predictor_loss'] = fp_metrics['predictor_loss']
 
         return metrics
 
@@ -572,7 +752,8 @@ class IPPOTrainer:
             total_timesteps = self.config.total_timesteps
 
         # Account for parallel environments in iteration count
-        steps_per_iteration = self.config.rollout_length * self.num_agents * self.num_envs
+        # Note: steps are counted per environment step, not per agent
+        steps_per_iteration = self.config.rollout_length * self.num_envs
         num_iterations = total_timesteps // steps_per_iteration
 
         training_info = {
@@ -587,6 +768,8 @@ class IPPOTrainer:
             total_timesteps=total_timesteps,
             num_agents=self.num_agents,
             log_interval=log_interval,
+            num_envs=self.num_envs,
+            rollout_length=self.config.rollout_length,
         )
 
         # Track best cleaning rate for milestones
@@ -656,6 +839,10 @@ class IPPOTrainer:
                 for agent_id, state in self.train_states.items()
             }
 
+        # Save MOA parameters if using social influence
+        if self.social_influence is not None:
+            checkpoint['moa_params'] = self.social_influence.get_moa_params()
+
         with open(path, 'wb') as f:
             pickle.dump(checkpoint, f)
 
@@ -675,6 +862,10 @@ class IPPOTrainer:
         else:
             for agent_id, params in checkpoint['params'].items():
                 self.train_states[agent_id] = self.train_states[agent_id].replace(params=params)
+
+        # Load MOA parameters if available
+        if self.social_influence is not None and 'moa_params' in checkpoint:
+            self.social_influence.set_moa_params(checkpoint['moa_params'])
 
         print(f"Checkpoint loaded from {path}")
 

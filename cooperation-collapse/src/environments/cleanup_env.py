@@ -79,9 +79,9 @@ class CleanupEnvironment:
         self,
         num_agents: int = 8,
         grid_size: Tuple[int, int] = (25, 18),
-        max_steps: int = 400,  # Shorter episodes for faster credit assignment
+        max_steps: int = 1000,  # Longer episodes for more complex dynamics
         apple_respawn_prob: float = 0.05,
-        pollution_spawn_prob: float = 0.7,  # Faster pollution for clearer feedback
+        pollution_spawn_prob: float = 0.4,  # Moderate pollution rate
         initial_apple_ratio: float = 0.05,  # Low initial apples to create urgency
         common_reward: bool = False,
         seed: int = 42,
@@ -289,7 +289,7 @@ class CleanupEnvironment:
             front_pos = self._get_front_position(agent)
             if front_pos and self._is_river_polluted(front_pos):
                 self.state.grid[front_pos] = self.RIVER_CLEAN
-                self.state.pollution_level = max(0, self.state.pollution_level - 0.1)
+                self._recalculate_pollution_level()
                 infos['cleaning_actions'] += 1
                 self.episode_cleaning_actions += 1
 
@@ -333,6 +333,12 @@ class CleanupEnvironment:
         """Check if position is polluted river."""
         return self.state.grid[pos] == self.RIVER_POLLUTED
 
+    def _recalculate_pollution_level(self):
+        """Recalculate pollution_level based on actual river state."""
+        polluted = sum(1 for pos in self.river_positions
+                       if self.state.grid[pos] == self.RIVER_POLLUTED)
+        self.state.pollution_level = polluted / len(self.river_positions)
+
     def _update_pollution(self):
         """Add pollution to river with some probability."""
         if self.rng.random() < self.pollution_spawn_prob:
@@ -344,7 +350,7 @@ class CleanupEnvironment:
             if clean_river:
                 pos = clean_river[self.rng.integers(len(clean_river))]
                 self.state.grid[pos] = self.RIVER_POLLUTED
-                self.state.pollution_level = min(1.0, self.state.pollution_level + 0.1)
+                self._recalculate_pollution_level()
 
     def _update_apples(self, infos: Dict):
         """Respawn apples based on pollution level."""

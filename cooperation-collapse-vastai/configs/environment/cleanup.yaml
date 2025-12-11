@@ -1,0 +1,37 @@
+# Cleanup Environment Configuration
+
+name: cleanup
+
+# Grid settings
+grid_size: [25, 18]  # Standard Cleanup map
+max_steps: 400  # Shorter episodes for faster credit assignment
+
+# Agent settings
+num_agents: 8
+observation_radius: 5  # 11x11 observation window
+
+# Resource dynamics
+apple_respawn_prob: 0.05
+pollution_spawn_prob: 0.7  # Faster pollution for clearer feedback
+initial_apple_ratio: 0.05  # Low initial apples to create urgency for cleaning
+cleaning_radius: 1
+
+# Reward structure
+apple_reward: 1.0
+cleaning_reward: 0.0  # No direct reward for cleaning
+common_reward: false  # Individual rewards by default
+
+# Action space
+# 0-3: move (up, down, left, right)
+# 4-5: rotate (left, right)
+# 6: clean
+# 7: collect/interact
+# 8: noop
+num_actions: 9
+
+# Spawn settings
+random_spawn: true
+spawn_region: river  # Agents spawn near river
+
+# Visual settings
+render_mode: rgb_array

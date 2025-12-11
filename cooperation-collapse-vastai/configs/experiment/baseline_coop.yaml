@@ -1,0 +1,27 @@
+# Phase 1: Cooperative Training Configuration
+
+name: baseline_cooperative
+
+# Experiment description
+description: "Train cooperative agents with shared rewards"
+
+# Override environment settings for cooperation
+environment:
+  common_reward: true  # Shared rewards encourage cooperation
+  num_agents: 8
+
+# Training settings
+training:
+  total_timesteps: 5_000_000
+  eval_interval: 50_000
+  eval_episodes: 10
+
+# Early stopping based on cooperation metrics
+early_stopping:
+  enabled: true
+  metric: cleaning_rate
+  threshold: 0.3  # Stop when cleaning rate > 30%
+  patience: 100_000
+
+# Checkpointing
+save_best_metric: collective_reward
